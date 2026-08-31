@@ -26,13 +26,40 @@ Python 3.11+, standard library only. No daemon required.
 
 ---
 
+## Requirements
+
+- **Python 3.11+** — standard library only, no pip packages.
+- **i3status-rust 0.34+** — for the `custom` block with `json = true`.
+- A bar that renders pango markup: **swaybar** (sway) or **i3bar** (i3).
+
+Optional: `github-cli` (a fallback for reading the Copilot quota) and
+`otf-font-awesome` (for [vendor logos](#vendor-logos) instead of text labels).
+
+You only need credentials for the services you actually use — see
+[Where the numbers come from](#where-the-numbers-come-from). Providers you do
+not subscribe to can be removed from `providers` in the config.
+
 ## Install
+
+### Arch Linux
+
+```sh
+git clone https://github.com/alfdupont/i3status-rs-ai-usage.git
+cd i3status-rs-ai-usage
+makepkg -si
+```
+
+### Manual
 
 ```sh
 install -Dm755 i3status-rs-ai-usage ~/.local/bin/i3status-rs-ai-usage
 ```
 
-Check it can see all three services:
+Make sure `~/.local/bin` is on your `PATH`.
+
+### Check it works
+
+Check it can see the services you subscribe to:
 
 ```sh
 i3status-rs-ai-usage show
@@ -53,17 +80,17 @@ Append `examples/i3status-rust.toml` to your config (e.g.
 ```toml
 [[block]]
 block = "custom"
-command = "~/.local/bin/i3status-rs-ai-usage render"
+command = "i3status-rs-ai-usage render"
 json = true
 interval = 30
 
 [[block.click]]
 button = "left"
-cmd = "~/.local/bin/i3status-rs-ai-usage poll --quiet"
+cmd = "i3status-rs-ai-usage poll --quiet"
 
 [[block.click]]
 button = "right"
-cmd = "notify-send 'AI usage' \"$(~/.local/bin/i3status-rs-ai-usage show --cached)\""
+cmd = "notify-send 'AI usage' \"$(i3status-rs-ai-usage show --cached)\""
 ```
 
 `interval = 30` is safe. `render` never touches the network: it prints a
@@ -178,7 +205,7 @@ The labels are plain strings, so they can be glyphs instead of `CL`/`CX`/`CP`.
 | OpenAI / Codex | `` | `U+E7CF` |
 | Copilot | `` | `U+E8C7` |
 
-Install the font (`ttf-font-awesome` on Arch, `fonts-font-awesome` on Debian),
+Install the font (`otf-font-awesome` on Arch, `fonts-font-awesome` on Debian),
 then copy `examples/config-icons.json` to
 `~/.config/i3status-rs-ai-usage/config.json`:
 
@@ -226,6 +253,23 @@ The bar is never allowed to lose its line.
 | `watch` | refresh forever, for the systemd service |
 
 All accept `--providers claude,codex`.
+
+## Uninstall
+
+```sh
+rm -f ~/.local/bin/i3status-rs-ai-usage          # or: pacman -Rns i3status-rs-ai-usage
+rm -rf ~/.config/i3status-rs-ai-usage ~/.cache/i3status-rs-ai-usage
+```
+
+Then remove the block from your i3status-rust config.
+
+## Contributing
+
+Adding a provider means writing one `fetch_*` function returning a `Usage`
+with one or more `Window`s, and registering it in the `PROVIDERS` dict.
+Everything else — caching, colouring, staleness, failure retention — is shared.
+
+Issues and pull requests welcome.
 
 ## Licence
 
