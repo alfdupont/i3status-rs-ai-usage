@@ -11,6 +11,11 @@ and **i3bar** on i3, unchanged.
 CL 12%/24%   CX 100%/47%   CP 34%
 ```
 
+![The block in a swaybar status line, with the right-click usage breakdown](docs/screenshot.png)
+
+*Vendor logos and text labels are both supported; the right click reports when
+each quota window resets.*
+
 | | Provider | Windows shown |
 |---|---|---|
 | `CL` | Claude Pro / Max | 5-hour session · 7-day |
@@ -209,11 +214,19 @@ The default colours are Catppuccin Mocha, matching the theme in
 The labels are plain strings, so they can be glyphs instead of `CL`/`CX`/`CP`.
 [Font Awesome 7 Brands][fa] ships real marks for all three vendors:
 
-| Provider | Glyph | Codepoint |
+| Provider | Font Awesome name | Codepoint |
 |---|---|---|
-| Claude | `` | `U+E861` |
-| OpenAI / Codex | `` | `U+E7CF` |
-| Copilot | `` | `U+E8C7` |
+| Claude | `claude` | `U+E861` |
+| OpenAI / Codex | `openai` | `U+E7CF` |
+| Copilot | `copilot` | `U+E8C7` |
+
+![The three vendor logos rendered in the bar](docs/labels-icons.png)
+
+The glyphs are not reproduced literally above because they live in the Unicode
+private use area, and no font GitHub serves contains them — they would render
+as blank boxes here however they were written. Copy
+`examples/config-icons.json` rather than the codepoints, and they will be
+correct.
 
 Install the font (`otf-font-awesome` on Arch, `fonts-font-awesome` on Debian),
 then copy `examples/config-icons.json` to
