@@ -100,7 +100,7 @@ cmd = "i3status-rs-ai-usage poll --quiet"
 
 [[block.click]]
 button = "right"
-cmd = "notify-send \"\" \"$(i3status-rs-ai-usage show --cached --brief)\""
+cmd = "notify-send 'AI usage' \"$(i3status-rs-ai-usage show --cached --brief)\""
 ```
 
 `interval = 30` is safe. `render` never touches the network: it prints a
