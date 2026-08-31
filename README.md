@@ -100,7 +100,7 @@ cmd = "i3status-rs-ai-usage poll --quiet"
 
 [[block.click]]
 button = "right"
-cmd = "notify-send 'AI usage' \"$(i3status-rs-ai-usage show --cached)\""
+cmd = "notify-send 'AI usage' \"$(i3status-rs-ai-usage show --cached --brief)\""
 ```
 
 `interval = 30` is safe. `render` never touches the network: it prints a
@@ -259,7 +259,7 @@ The bar is never allowed to lose its line.
 |---|---|
 | `render` | one line of i3status-rust JSON, from cache (`--no-refresh`, `--plain`) |
 | `poll` | refresh the cache; this is the part that uses the network |
-| `show` | human-readable breakdown (`--cached` to skip the network) |
+| `show` | human-readable breakdown (`--cached` to skip the network, `--brief` for a compact form suited to notifications) |
 | `watch` | refresh forever, for the systemd service |
 
 All accept `--providers claude,codex`.

@@ -19,4 +19,4 @@ cmd = "i3status-rs-ai-usage poll --quiet"
 # Right click: full breakdown in a notification.
 [[block.click]]
 button = "right"
-cmd = "notify-send 'AI usage' \"$(i3status-rs-ai-usage show --cached)\""
+cmd = "notify-send 'AI usage' \"$(i3status-rs-ai-usage show --cached --brief)\""
