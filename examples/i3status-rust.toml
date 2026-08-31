@@ -1,0 +1,22 @@
+# i3status-rs-ai-usage — drop this block into your i3status-rust config.
+#
+# `render` only reads a cache and forks a refresh in the background, so it
+# returns in ~100 ms and never stalls the bar even when the network is down.
+# A short `interval` is therefore fine; the actual refresh rate is governed by
+# `refresh_interval` in ~/.config/i3status-rs-ai-usage/config.json.
+
+[[block]]
+block = "custom"
+command = "~/.local/bin/i3status-rs-ai-usage render"
+json = true
+interval = 30
+
+# Left click: force an immediate refresh.
+[[block.click]]
+button = "left"
+cmd = "~/.local/bin/i3status-rs-ai-usage poll --quiet"
+
+# Right click: full breakdown in a notification.
+[[block.click]]
+button = "right"
+cmd = "notify-send 'AI usage' \"$(~/.local/bin/i3status-rs-ai-usage show --cached)\""

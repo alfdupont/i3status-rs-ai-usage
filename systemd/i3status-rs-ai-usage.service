@@ -1,0 +1,10 @@
+[Unit]
+Description=Refresh AI subscription usage for swaybar
+Documentation=https://github.com/alfdupont/i3status-rs-ai-usage
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/i3status-rs-ai-usage poll --quiet
+# The network can be down; a failed refresh keeps the last good reading.
+SuccessExitStatus=1

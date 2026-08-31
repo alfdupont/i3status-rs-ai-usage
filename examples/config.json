@@ -1,0 +1,11 @@
+{
+  "providers": ["claude", "codex", "copilot"],
+  "refresh_interval": 180,
+  "stale_after": 900,
+  "warn_at": 75,
+  "critical_at": 90,
+  "labels": { "claude": "CL", "codex": "CX", "copilot": "CP" },
+  "separator": "  ",
+  "show_short_window": true,
+  "show_reset": false
+}

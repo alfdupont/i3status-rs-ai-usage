@@ -1,0 +1,11 @@
+[Unit]
+Description=Refresh AI subscription usage for swaybar
+
+[Timer]
+OnStartupSec=15s
+OnUnitActiveSec=3min
+AccuracySec=15s
+Persistent=false
+
+[Install]
+WantedBy=timers.target

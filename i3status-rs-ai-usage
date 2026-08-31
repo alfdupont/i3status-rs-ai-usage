@@ -1,0 +1,911 @@
+#!/usr/bin/env python3
+#
+# i3status-rs-ai-usage — AI subscription usage as an i3status-rust block.
+# Copyright (C) 2026 alfdupont
+#
+# This program is free software: you can redistribute it and/or modify it
+# under the terms of the GNU General Public License as published by the Free
+# Software Foundation, either version 3 of the License, or (at your option)
+# any later version.
+#
+# This program is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
+# more details.
+#
+# You should have received a copy of the GNU General Public License along
+# with this program.  If not, see <https://www.gnu.org/licenses/>.
+"""i3status-rs-ai-usage — AI subscription usage as an i3status-rust block.
+
+Works with swaybar on sway and i3bar on i3.
+
+Reports how much of your plan quota you have burned for:
+
+  claude   Claude Pro / Max      (Anthropic OAuth usage endpoint)
+  codex    ChatGPT Plus / Pro    (Codex CLI session rollout files)
+  copilot  GitHub Copilot        (copilot_internal/user quota snapshots)
+
+Two subcommands matter:
+
+  render   print one line of i3status-rust `custom` JSON.  Never blocks:
+           it reads a cache and forks a refresh in the background.
+  poll     refresh the cache (this is the part that touches the network).
+
+See README.md for the i3status-rust wiring.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field, asdict
+from pathlib import Path
+from typing import Any, Iterable, Sequence
+
+__version__ = "1.0.0"
+
+HTTP_TIMEOUT = 12.0
+USER_AGENT = f"i3status-rs-ai-usage/{__version__}"
+
+# ---------------------------------------------------------------------------
+# paths
+# ---------------------------------------------------------------------------
+
+
+def _xdg(var: str, default: str) -> Path:
+    return Path(os.environ.get(var) or Path.home() / default)
+
+
+CONFIG_DIR = _xdg("XDG_CONFIG_HOME", ".config") / "i3status-rs-ai-usage"
+CONFIG_PATH = CONFIG_DIR / "config.json"
+CACHE_DIR = _xdg("XDG_CACHE_HOME", ".cache") / "i3status-rs-ai-usage"
+CACHE_PATH = CACHE_DIR / "state.json"
+LOCK_PATH = CACHE_DIR / "poll.lock"
+
+CLAUDE_CREDENTIALS = Path.home() / ".claude" / ".credentials.json"
+CODEX_SESSIONS = Path.home() / ".codex" / "sessions"
+COPILOT_APPS = _xdg("XDG_CONFIG_HOME", ".config") / "github-copilot" / "apps.json"
+
+
+# ---------------------------------------------------------------------------
+# config
+# ---------------------------------------------------------------------------
+
+DEFAULT_CONFIG: dict[str, Any] = {
+    # Which providers to show, in bar order.
+    "providers": ["claude", "codex", "copilot"],
+    # Seconds before the cache is considered stale and a refresh is forked.
+    "refresh_interval": 180,
+    # Seconds after which a cached reading is rendered as dimmed/stale.
+    "stale_after": 900,
+    # Percent-used thresholds driving the colours below.
+    "warn_at": 75,
+    "critical_at": 90,
+    # Catppuccin Mocha, matching the sample i3status-rust theme.
+    "colors": {
+        "normal": "#cdd6f4",
+        "warn": "#fab387",
+        "critical": "#f38ba8",
+        "label": "#7f849c",
+        "dim": "#585b70",
+        "error": "#f38ba8",
+    },
+    # Per-provider bar labels.
+    "labels": {"claude": "CL", "codex": "CX", "copilot": "CP"},
+    # "pango"  -> one block, each provider coloured independently (default)
+    # "plain"  -> no markup, block-level state colour only
+    "markup": "pango",
+    # Separator drawn between providers.
+    "separator": "  ",
+    # Show the shorter (session) window as well as the long one.
+    "show_short_window": True,
+    # Append a "resets in" hint to the window closest to exhaustion.
+    "show_reset": False,
+}
+
+
+def load_config() -> dict[str, Any]:
+    cfg = json.loads(json.dumps(DEFAULT_CONFIG))  # deep copy
+    try:
+        raw = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return cfg
+    except (OSError, ValueError) as exc:
+        print(f"i3status-rs-ai-usage: bad config {CONFIG_PATH}: {exc}", file=sys.stderr)
+        return cfg
+    for key, val in raw.items():
+        if isinstance(val, dict) and isinstance(cfg.get(key), dict):
+            cfg[key].update(val)
+        else:
+            cfg[key] = val
+    return cfg
+
+
+# ---------------------------------------------------------------------------
+# model
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class Window:
+    """One quota window (a rolling session window, a week, a month...)."""
+
+    key: str           # short label shown in the bar, e.g. "5h", "7d", "mo"
+    used_pct: float    # 0..100, percent of the window's allowance consumed
+    resets_at: float | None = None   # unix epoch seconds
+    # True when we inferred the window rolled over rather than observing it.
+    assumed_reset: bool = False
+
+
+@dataclass
+class Usage:
+    provider: str
+    ok: bool = True
+    windows: list[Window] = field(default_factory=list)
+    error: str | None = None
+    # Set when a refresh failed but we are still showing the previous good
+    # reading rather than throwing it away.
+    last_error: str | None = None
+    detail: str | None = None       # plan name etc, for `show`
+    fetched_at: float = field(default_factory=time.time)
+    # Epoch of the underlying observation; for file-derived providers this
+    # can be much older than fetched_at.
+    observed_at: float | None = None
+
+    def to_json(self) -> dict[str, Any]:
+        d = asdict(self)
+        d["windows"] = [asdict(w) for w in self.windows]
+        return d
+
+    @staticmethod
+    def from_json(d: dict[str, Any]) -> "Usage":
+        windows = [Window(**w) for w in d.get("windows", [])]
+        return Usage(
+            provider=d["provider"],
+            ok=d.get("ok", False),
+            windows=windows,
+            error=d.get("error"),
+            last_error=d.get("last_error"),
+            detail=d.get("detail"),
+            fetched_at=d.get("fetched_at", 0.0),
+            observed_at=d.get("observed_at"),
+        )
+
+    @property
+    def peak(self) -> float:
+        return max((w.used_pct for w in self.windows), default=0.0)
+
+
+def failed(provider: str, error: str) -> Usage:
+    return Usage(provider=provider, ok=False, error=error)
+
+
+# ---------------------------------------------------------------------------
+# small helpers
+# ---------------------------------------------------------------------------
+
+
+def http_json(url: str, headers: dict[str, str], timeout: float = HTTP_TIMEOUT) -> Any:
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, **headers})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.load(resp)
+
+
+def read_json(path: Path) -> Any:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def parse_iso8601(value: str) -> float | None:
+    """Epoch seconds from an ISO-8601 string, tolerating a trailing Z."""
+    if not value:
+        return None
+    import datetime as _dt
+
+    try:
+        return _dt.datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def humanize_delta(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes = seconds // 60
+    if minutes < 60:
+        return f"{minutes}m"
+    hours, minutes = divmod(minutes, 60)
+    if hours < 24:
+        return f"{hours}h{minutes:02d}m" if minutes else f"{hours}h"
+    days, hours = divmod(hours, 24)
+    return f"{days}d{hours}h" if hours else f"{days}d"
+
+
+def tail_lines(path: Path, max_bytes: int) -> Iterable[str]:
+    """Yield lines from the end of a file backwards, reading at most max_bytes.
+
+    Codex rollout files reach tens of megabytes, so the newest rate-limit
+    record has to be found without walking the whole file.
+    """
+    chunk_size = 1 << 20
+    with path.open("rb") as fh:
+        fh.seek(0, os.SEEK_END)
+        pos = fh.tell()
+        floor = max(0, pos - max_bytes)
+        remainder = b""
+        while pos > floor:
+            step = min(chunk_size, pos - floor)
+            pos -= step
+            fh.seek(pos)
+            block = fh.read(step) + remainder
+            parts = block.split(b"\n")
+            remainder = parts.pop(0)  # may be a partial line; carry it left
+            for raw in reversed(parts):
+                if raw.strip():
+                    yield raw.decode("utf-8", "replace")
+        if remainder.strip() and pos == 0:
+            yield remainder.decode("utf-8", "replace")
+
+
+# ---------------------------------------------------------------------------
+# provider: Claude (Anthropic OAuth usage endpoint)
+# ---------------------------------------------------------------------------
+
+CLAUDE_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+
+# The endpoint returns many named buckets; these are the ones a Pro/Max
+# subscriber actually has, in the order we want to show them.
+CLAUDE_WINDOWS = [("five_hour", "5h"), ("seven_day", "7d")]
+
+
+def fetch_claude() -> Usage:
+    try:
+        creds = read_json(CLAUDE_CREDENTIALS).get("claudeAiOauth") or {}
+    except FileNotFoundError:
+        return failed("claude", "not logged in")
+    except (OSError, ValueError) as exc:
+        return failed("claude", f"credentials: {exc}")
+
+    token = creds.get("accessToken")
+    if not token:
+        return failed("claude", "no access token")
+
+    # The access token is short-lived. Claude Code refreshes it whenever it
+    # runs; we deliberately do not refresh it ourselves, because rotating the
+    # refresh token from here could invalidate the CLI's own session.
+    expires_at = creds.get("expiresAt")
+    if isinstance(expires_at, (int, float)) and expires_at / 1000 < time.time():
+        return failed("claude", "token expired (run claude)")
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "anthropic-beta": "oauth-2025-04-20",
+        "Content-Type": "application/json",
+    }
+    try:
+        data = http_json(CLAUDE_USAGE_URL, headers)
+    except urllib.error.HTTPError as exc:
+        if exc.code in (401, 403):
+            return failed("claude", "auth rejected (run claude)")
+        return failed("claude", f"http {exc.code}")
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        return failed("claude", f"unreachable: {exc}")
+
+    windows: list[Window] = []
+    for field_name, label in CLAUDE_WINDOWS:
+        bucket = data.get(field_name)
+        if not isinstance(bucket, dict):
+            continue
+        util = bucket.get("utilization")
+        if util is None:
+            continue
+        windows.append(
+            Window(
+                key=label,
+                used_pct=float(util),
+                resets_at=parse_iso8601(bucket.get("resets_at") or ""),
+            )
+        )
+
+    if not windows:
+        return failed("claude", "no usage windows")
+
+    detail = creds.get("subscriptionType") or "claude"
+    return Usage(provider="claude", windows=windows, detail=detail,
+                 observed_at=time.time())
+
+
+# ---------------------------------------------------------------------------
+# provider: Codex (ChatGPT) — parsed from CLI session rollout files
+# ---------------------------------------------------------------------------
+
+# There is no reachable HTTP endpoint for this: chatgpt.com/backend-api is
+# behind Cloudflare and answers 403 to anything but the CLI itself. The Codex
+# CLI does however record the server's rate-limit headers into every session
+# rollout file, so we read the newest such record.
+
+CODEX_SCAN_FILES = 6          # newest N rollout files to inspect
+CODEX_TAIL_BYTES = 4 << 20    # how far back to read in each
+
+_RATE_LIMIT_HINT = re.compile(r'"rate_limits"\s*:\s*\{')
+
+
+def _codex_recent_sessions(root: Path, limit: int) -> list[Path]:
+    files: list[tuple[float, Path]] = []
+    for path in root.rglob("*.jsonl"):
+        try:
+            files.append((path.stat().st_mtime, path))
+        except OSError:
+            continue
+    files.sort(reverse=True)
+    return [p for _, p in files[:limit]]
+
+
+def _codex_scan_file(path: Path) -> tuple[float, dict[str, Any]] | None:
+    """Newest (timestamp, rate_limits) in one rollout file, or None."""
+    for line in tail_lines(path, CODEX_TAIL_BYTES):
+        if not _RATE_LIMIT_HINT.search(line):
+            continue
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        limits = _find_rate_limits(record)
+        if limits is None:
+            continue
+        # Codex emits several limit families; only the one carrying window
+        # data ("codex") is useful, the "premium"/credits one is all nulls.
+        if not (limits.get("primary") or limits.get("secondary")):
+            continue
+        stamp = parse_iso8601(record.get("timestamp") or "") or path.stat().st_mtime
+        return stamp, limits
+    return None
+
+
+def _find_rate_limits(node: Any) -> dict[str, Any] | None:
+    if isinstance(node, dict):
+        candidate = node.get("rate_limits")
+        if isinstance(candidate, dict):
+            return candidate
+        for value in node.values():
+            found = _find_rate_limits(value)
+            if found is not None:
+                return found
+    elif isinstance(node, list):
+        for value in node:
+            found = _find_rate_limits(value)
+            if found is not None:
+                return found
+    return None
+
+
+def _codex_window(raw: Any, now: float) -> Window | None:
+    if not isinstance(raw, dict):
+        return None
+    used = raw.get("used_percent")
+    if used is None:
+        return None
+    minutes = raw.get("window_minutes") or 0
+    resets_at = raw.get("resets_at")
+    key = _codex_window_label(minutes)
+
+    # A window whose reset time has passed has rolled over. Usage only accrues
+    # while Codex runs, and Codex would have rewritten this record if it had
+    # run since, so the new window is genuinely empty.
+    if isinstance(resets_at, (int, float)) and resets_at < now:
+        return Window(key=key, used_pct=0.0, resets_at=None, assumed_reset=True)
+    return Window(key=key, used_pct=float(used),
+                  resets_at=float(resets_at) if resets_at else None)
+
+
+def _codex_window_label(minutes: float) -> str:
+    if not minutes:
+        return "?"
+    if minutes % 10080 == 0:
+        return f"{int(minutes // 10080)}w" if minutes > 10080 else "7d"
+    if minutes % 1440 == 0:
+        return f"{int(minutes // 1440)}d"
+    if minutes % 60 == 0:
+        return f"{int(minutes // 60)}h"
+    return f"{int(minutes)}m"
+
+
+def fetch_codex() -> Usage:
+    if not CODEX_SESSIONS.is_dir():
+        return failed("codex", "no codex sessions")
+
+    best: tuple[float, dict[str, Any]] | None = None
+    for path in _codex_recent_sessions(CODEX_SESSIONS, CODEX_SCAN_FILES):
+        try:
+            found = _codex_scan_file(path)
+        except OSError:
+            continue
+        if found and (best is None or found[0] > best[0]):
+            best = found
+
+    if best is None:
+        return failed("codex", "no rate-limit record")
+
+    observed_at, limits = best
+    now = time.time()
+    windows = [
+        w
+        for w in (
+            _codex_window(limits.get("primary"), now),
+            _codex_window(limits.get("secondary"), now),
+        )
+        if w is not None
+    ]
+    if not windows:
+        return failed("codex", "no usage windows")
+
+    return Usage(
+        provider="codex",
+        windows=windows,
+        detail=limits.get("plan_type") or "codex",
+        observed_at=observed_at,
+    )
+
+
+# ---------------------------------------------------------------------------
+# provider: GitHub Copilot
+# ---------------------------------------------------------------------------
+
+COPILOT_USER_URL = "https://api.github.com/copilot_internal/user"
+
+# Free/Pro seats meter "premium_interactions"; enterprise seats do too, while
+# chat/completions come back flagged unlimited. Prefer the metered one.
+COPILOT_QUOTA_ORDER = ["premium_interactions", "chat", "completions"]
+
+
+def _copilot_tokens() -> list[str]:
+    tokens: list[str] = []
+    try:
+        apps = read_json(COPILOT_APPS)
+    except (OSError, ValueError):
+        return tokens
+    if isinstance(apps, dict):
+        for entry in apps.values():
+            if isinstance(entry, dict) and entry.get("oauth_token"):
+                tokens.append(entry["oauth_token"])
+    return tokens
+
+
+def _copilot_via_gh() -> Any:
+    """Fallback for setups where only the gh CLI holds a usable token."""
+    proc = subprocess.run(
+        ["gh", "api", "/copilot_internal/user"],
+        capture_output=True,
+        text=True,
+        timeout=HTTP_TIMEOUT,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError((proc.stderr or "gh failed").strip().splitlines()[-1])
+    return json.loads(proc.stdout)
+
+
+def fetch_copilot() -> Usage:
+    data = None
+    last_error = "no copilot credentials"
+
+    for token in _copilot_tokens():
+        try:
+            data = http_json(
+                COPILOT_USER_URL,
+                {
+                    "Authorization": f"token {token}",
+                    "Accept": "application/json",
+                    "Editor-Version": USER_AGENT,
+                },
+            )
+            break
+        except urllib.error.HTTPError as exc:
+            last_error = f"http {exc.code}"
+        except (urllib.error.URLError, OSError, ValueError) as exc:
+            last_error = f"unreachable: {exc}"
+
+    if data is None:
+        try:
+            data = _copilot_via_gh()
+        except FileNotFoundError:
+            return failed("copilot", last_error)
+        except Exception as exc:  # noqa: BLE001 - gh surfaces many failures
+            return failed("copilot", last_error if last_error else str(exc))
+
+    snapshots = data.get("quota_snapshots")
+    if not isinstance(snapshots, dict) or not snapshots:
+        return failed("copilot", "no quota data")
+
+    chosen_name, chosen = None, None
+    for name in COPILOT_QUOTA_ORDER:
+        snap = snapshots.get(name)
+        if isinstance(snap, dict) and not snap.get("unlimited"):
+            chosen_name, chosen = name, snap
+            break
+
+    if chosen is None:
+        # Every bucket is unlimited (some enterprise seats). Say so rather
+        # than inventing a number.
+        return Usage(
+            provider="copilot",
+            windows=[],
+            detail=f"{data.get('copilot_plan') or 'copilot'} (unlimited)",
+            observed_at=time.time(),
+        )
+
+    remaining = chosen.get("percent_remaining")
+    if remaining is None:
+        return failed("copilot", "no percent_remaining")
+
+    resets_at = parse_iso8601((data.get("quota_reset_date") or "") + "T00:00:00+00:00")
+    window = Window(key="mo", used_pct=max(0.0, 100.0 - float(remaining)),
+                    resets_at=resets_at)
+
+    detail = f"{data.get('copilot_plan') or 'copilot'} · {chosen_name}"
+    entitlement = chosen.get("entitlement")
+    if entitlement:
+        detail += f" {int(chosen.get('remaining') or 0)}/{int(entitlement)} left"
+
+    return Usage(provider="copilot", windows=[window], detail=detail,
+                 observed_at=time.time())
+
+
+PROVIDERS = {
+    "claude": fetch_claude,
+    "codex": fetch_codex,
+    "copilot": fetch_copilot,
+}
+
+
+# ---------------------------------------------------------------------------
+# cache
+# ---------------------------------------------------------------------------
+
+
+def load_cache() -> dict[str, Usage]:
+    try:
+        raw = read_json(CACHE_PATH)
+    except (OSError, ValueError):
+        return {}
+    out: dict[str, Usage] = {}
+    for name, entry in (raw.get("providers") or {}).items():
+        try:
+            out[name] = Usage.from_json(entry)
+        except (KeyError, TypeError):
+            continue
+    return out
+
+
+def save_cache(results: dict[str, Usage]) -> None:
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "version": 1,
+        "updated_at": time.time(),
+        "providers": {name: usage.to_json() for name, usage in results.items()},
+    }
+    tmp = CACHE_PATH.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(payload, indent=1), encoding="utf-8")
+    os.replace(tmp, CACHE_PATH)  # atomic: render never sees a half-written file
+
+
+def cache_age() -> float:
+    try:
+        return time.time() - CACHE_PATH.stat().st_mtime
+    except OSError:
+        return float("inf")
+
+
+def poll(providers: Sequence[str], merge: bool = True) -> dict[str, Usage]:
+    """Fetch every provider in parallel and write the cache."""
+    wanted = [p for p in providers if p in PROVIDERS]
+    results: dict[str, Usage] = {}
+    if wanted:
+        with ThreadPoolExecutor(max_workers=len(wanted)) as pool:
+            futures = {name: pool.submit(PROVIDERS[name]) for name in wanted}
+            for name, future in futures.items():
+                try:
+                    results[name] = future.result(timeout=HTTP_TIMEOUT + 5)
+                except Exception as exc:  # noqa: BLE001 - never kill the bar
+                    results[name] = failed(name, f"{type(exc).__name__}: {exc}")
+
+    merged = load_cache() if merge else {}
+    for name in list(results):
+        fresh, previous = results[name], merged.get(name)
+        if not fresh.ok and previous is not None and previous.ok:
+            # A transient failure (offline, expired token) must not throw away
+            # a good reading. Keep the old numbers, remember why the refresh
+            # failed, and leave fetched_at alone so render() dims it as it ages.
+            previous.last_error = fresh.error
+            results[name] = previous
+        else:
+            fresh.last_error = None
+            results[name] = fresh
+        merged[name] = results[name]
+
+    save_cache(merged)
+    return results
+
+
+def fork_refresh(providers: Sequence[str]) -> None:
+    """Kick off `poll` detached, with a crude lock so we spawn at most one."""
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        # O_EXCL makes this the lock; a stale lock is cleared after 2 minutes.
+        fd = os.open(str(LOCK_PATH), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        os.close(fd)
+    except FileExistsError:
+        try:
+            if time.time() - LOCK_PATH.stat().st_mtime < 120:
+                return
+            LOCK_PATH.unlink()
+        except OSError:
+            return
+        return
+    except OSError:
+        return
+
+    try:
+        subprocess.Popen(
+            [sys.executable, os.path.abspath(__file__), "poll",
+             "--providers", ",".join(providers), "--unlock"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except OSError:
+        LOCK_PATH.unlink(missing_ok=True)
+
+
+# ---------------------------------------------------------------------------
+# rendering
+# ---------------------------------------------------------------------------
+
+STATE_ORDER = ["idle", "info", "good", "warning", "critical"]
+
+
+def severity(pct: float, cfg: dict[str, Any]) -> str:
+    if pct >= cfg["critical_at"]:
+        return "critical"
+    if pct >= cfg["warn_at"]:
+        return "warning"
+    return "idle"
+
+
+def pango_escape(text: str) -> str:
+    return (
+        text.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+    )
+
+
+def colorize(text: str, color: str, cfg: dict[str, Any]) -> str:
+    if cfg.get("markup") != "pango":
+        return text
+    return f'<span foreground="{color}">{pango_escape(text)}</span>'
+
+
+def render_provider(usage: Usage, cfg: dict[str, Any], now: float) -> tuple[str, str]:
+    """Return (markup, state) for one provider."""
+    colors = cfg["colors"]
+    label = cfg["labels"].get(usage.provider, usage.provider[:2].upper())
+
+    if not usage.ok:
+        # "warning", not "critical": a broken login should not look identical
+        # to a genuinely exhausted quota. The red glyph already says enough.
+        return colorize(f"{label} !", colors["error"], cfg), "warning"
+
+    if not usage.windows:
+        # Unlimited plan, or nothing metered.
+        return colorize(f"{label} ∞", colors["label"], cfg), "idle"
+
+    windows = usage.windows if cfg["show_short_window"] else usage.windows[-1:]
+
+    # Staleness means "we have not managed to refresh", not "the underlying
+    # observation is old". Codex usage only moves while Codex runs, so a
+    # reading from hours ago is still exactly correct.
+    stale = (now - usage.fetched_at) > cfg["stale_after"]
+
+    parts = []
+    worst = "idle"
+    for win in windows:
+        state = severity(win.used_pct, cfg)
+        if STATE_ORDER.index(state) > STATE_ORDER.index(worst):
+            worst = state
+        if stale:
+            color = colors["dim"]
+        elif state == "critical":
+            color = colors["critical"]
+        elif state == "warning":
+            color = colors["warn"]
+        else:
+            color = colors["normal"]
+        parts.append(colorize(f"{win.used_pct:.0f}%", color, cfg))
+
+    body = colorize("/", colors["dim"], cfg).join(parts)
+    text = f"{colorize(label, colors['label'], cfg)} {body}"
+
+    if cfg["show_reset"]:
+        hottest = max(usage.windows, key=lambda w: w.used_pct)
+        if hottest.resets_at and hottest.resets_at > now:
+            hint = humanize_delta(hottest.resets_at - now)
+            text += " " + colorize(f"({hint})", colors["dim"], cfg)
+
+    if stale:
+        text += colorize("·", colors["dim"], cfg)
+        worst = "idle"
+
+    return text, worst
+
+
+def render(cfg: dict[str, Any], no_refresh: bool = False) -> dict[str, Any]:
+    providers = [p for p in cfg["providers"] if p in PROVIDERS]
+    cached = load_cache()
+
+    if not no_refresh and cache_age() > cfg["refresh_interval"]:
+        fork_refresh(providers)
+
+    now = time.time()
+    chunks, worst = [], "idle"
+    peak = None
+    for name in providers:
+        usage = cached.get(name)
+        if usage is not None and usage.ok and usage.windows:
+            # Only the windows we actually render may drive short_text.
+            shown = usage.windows if cfg["show_short_window"] else usage.windows[-1:]
+            candidate = max(w.used_pct for w in shown)
+            peak = candidate if peak is None else max(peak, candidate)
+        if usage is None:
+            chunks.append(
+                colorize(
+                    f"{cfg['labels'].get(name, name[:2].upper())} …",
+                    cfg["colors"]["dim"],
+                    cfg,
+                )
+            )
+            continue
+        text, state = render_provider(usage, cfg, now)
+        chunks.append(text)
+        if STATE_ORDER.index(state) > STATE_ORDER.index(worst):
+            worst = state
+
+    sep = cfg["separator"]
+    if cfg.get("markup") == "pango":
+        sep = colorize(sep, cfg["colors"]["dim"], cfg)
+
+    full = sep.join(chunks)
+    short = f"{peak:.0f}%" if peak is not None else "…"
+    return {"state": worst, "text": full, "short_text": short}
+
+
+# ---------------------------------------------------------------------------
+# human-readable output for `show`
+# ---------------------------------------------------------------------------
+
+
+def show(cfg: dict[str, Any], results: dict[str, Usage]) -> str:
+    now = time.time()
+    lines = []
+    for name in cfg["providers"]:
+        usage = results.get(name)
+        if usage is None:
+            lines.append(f"{name:8} (no data)")
+            continue
+        if not usage.ok:
+            lines.append(f"{name:8} ERROR  {usage.error}")
+            continue
+        if not usage.windows:
+            lines.append(f"{name:8} unlimited  ({usage.detail})")
+            continue
+        bits = []
+        for win in usage.windows:
+            piece = f"{win.key} {win.used_pct:5.1f}%"
+            if win.resets_at and win.resets_at > now:
+                piece += f" (resets in {humanize_delta(win.resets_at - now)})"
+            elif win.assumed_reset:
+                piece += " (window rolled over)"
+            bits.append(piece)
+        age = ""
+        if usage.observed_at:
+            age = f"  [observed {humanize_delta(now - usage.observed_at)} ago]"
+        note = f"  !! last refresh failed: {usage.last_error}" if usage.last_error else ""
+        lines.append(f"{name:8} " + "   ".join(bits) + f"  · {usage.detail}{age}{note}")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# cli
+# ---------------------------------------------------------------------------
+
+
+def split_providers(value: str | None, cfg: dict[str, Any]) -> list[str]:
+    if not value:
+        return list(cfg["providers"])
+    return [p.strip() for p in value.split(",") if p.strip()]
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="i3status-rs-ai-usage",
+        description="AI subscription usage as an i3status-rust block.",
+    )
+    parser.add_argument("--version", action="version", version=__version__)
+    sub = parser.add_subparsers(dest="cmd")
+
+    p_render = sub.add_parser("render", help="print i3status-rust custom JSON")
+    p_render.add_argument("--providers")
+    p_render.add_argument("--no-refresh", action="store_true",
+                          help="never fork a background refresh")
+    p_render.add_argument("--plain", action="store_true",
+                          help="disable pango markup")
+
+    p_poll = sub.add_parser("poll", help="refresh the cache (touches the network)")
+    p_poll.add_argument("--providers")
+    p_poll.add_argument("--unlock", action="store_true", help=argparse.SUPPRESS)
+    p_poll.add_argument("--quiet", action="store_true")
+
+    p_show = sub.add_parser("show", help="human-readable usage (fetches live)")
+    p_show.add_argument("--providers")
+    p_show.add_argument("--cached", action="store_true", help="read the cache only")
+
+    sub.add_parser("watch", help="refresh forever, for a systemd service")
+
+    args = parser.parse_args(argv)
+    cfg = load_config()
+    cmd = args.cmd or "render"
+
+    if cmd == "render":
+        if getattr(args, "plain", False):
+            cfg["markup"] = "plain"
+        if args.providers:
+            cfg["providers"] = split_providers(args.providers, cfg)
+        try:
+            payload = render(cfg, no_refresh=args.no_refresh)
+        except Exception as exc:  # noqa: BLE001 - the bar must always get a line
+            payload = {"state": "critical", "text": f"ai-usage: {exc}", "short_text": "!"}
+        print(json.dumps(payload))
+        return 0
+
+    if cmd == "poll":
+        providers = split_providers(args.providers, cfg)
+        try:
+            results = poll(providers)
+        finally:
+            if args.unlock:
+                LOCK_PATH.unlink(missing_ok=True)
+        if not args.quiet:
+            print(show(cfg, results))
+        return 0 if all(u.ok for u in results.values()) else 1
+
+    if cmd == "show":
+        providers = split_providers(args.providers, cfg)
+        cfg["providers"] = providers
+        results = load_cache() if args.cached else poll(providers)
+        print(show(cfg, results))
+        return 0
+
+    if cmd == "watch":
+        interval = max(30, int(cfg["refresh_interval"]))
+        while True:
+            try:
+                poll(list(cfg["providers"]))
+            except Exception as exc:  # noqa: BLE001 - a daemon must not die
+                print(f"i3status-rs-ai-usage: poll failed: {exc}", file=sys.stderr)
+            time.sleep(interval)
+
+    parser.print_help()
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
