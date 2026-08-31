@@ -158,6 +158,7 @@ Notable keys:
   reading is dimmed. This tracks failure to refresh, **not** the age of the
   underlying observation, so Codex data from this morning is not falsely
   greyed out.
+- **`labels`** / **`label_font`** — see [Vendor logos](#vendor-logos) below.
 - **`markup`** — set to `"plain"` (or pass `--plain`) to drop pango markup and
   let i3status-rust colour the whole block from its `state` instead.
 
@@ -165,6 +166,41 @@ The default colours are Catppuccin Mocha, matching the theme in
 `examples/i3status-rust.toml`.
 
 ---
+
+## Vendor logos
+
+The labels are plain strings, so they can be glyphs instead of `CL`/`CX`/`CP`.
+[Font Awesome 7 Brands][fa] ships real marks for all three vendors:
+
+| Provider | Glyph | Codepoint |
+|---|---|---|
+| Claude | `` | `U+E861` |
+| OpenAI / Codex | `` | `U+E7CF` |
+| Copilot | `` | `U+E8C7` |
+
+Install the font (`ttf-font-awesome` on Arch, `fonts-font-awesome` on Debian),
+then copy `examples/config-icons.json` to
+`~/.config/i3status-rs-ai-usage/config.json`:
+
+```json
+{
+  "label_font": "Font Awesome 7 Brands",
+  "labels": { "claude": "", "codex": "", "copilot": "" },
+  "separator": "   "
+}
+```
+
+**`label_font` matters.** These glyphs live in the Unicode private use area,
+which is a free-for-all: on a typical desktop the same codepoints are also
+claimed by CJK fonts, Junicode and IBM Plex Sans TC. Leaving the pick to
+fontconfig can silently render an unrelated glyph, and which one you get
+varies by machine. Naming the face pins it, and it applies to the label only —
+the numbers still use your bar font.
+
+If you would rather not install a font, these Unicode approximations need
+nothing extra: `✳` (U+2733), `❋` (U+274B), `✻` (U+273B).
+
+[fa]: https://fontawesome.com/
 
 ## Behaviour when things break
 

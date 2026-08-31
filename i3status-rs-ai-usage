@@ -98,8 +98,14 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "dim": "#585b70",
         "error": "#f38ba8",
     },
-    # Per-provider bar labels.
+    # Per-provider bar labels. These can be glyphs rather than text; see
+    # examples/config-icons.json for the Font Awesome 7 Brands logos.
     "labels": {"claude": "CL", "codex": "CX", "copilot": "CP"},
+    # Font to force for the label only. Icon glyphs live in the private use
+    # area, where several unrelated fonts (CJK, Junicode, IBM Plex TC) claim
+    # the same codepoints, so leaving the choice to fontconfig can render the
+    # wrong glyph. Naming the face pins it. Empty = inherit the bar font.
+    "label_font": "",
     # "pango"  -> one block, each provider coloured independently (default)
     # "plain"  -> no markup, block-level state colour only
     "markup": "pango",
@@ -689,10 +695,18 @@ def pango_escape(text: str) -> str:
     )
 
 
-def colorize(text: str, color: str, cfg: dict[str, Any]) -> str:
+def colorize(text: str, color: str, cfg: dict[str, Any], face: str = "") -> str:
     if cfg.get("markup") != "pango":
         return text
-    return f'<span foreground="{color}">{pango_escape(text)}</span>'
+    attrs = f'foreground="{color}"'
+    if face:
+        attrs += f' face="{pango_escape(face)}"'
+    return f"<span {attrs}>{pango_escape(text)}</span>"
+
+
+def colorize_label(text: str, color: str, cfg: dict[str, Any]) -> str:
+    """Labels may be icon glyphs, so they get the pinned label font."""
+    return colorize(text, color, cfg, face=cfg.get("label_font") or "")
 
 
 def render_provider(usage: Usage, cfg: dict[str, Any], now: float) -> tuple[str, str]:
@@ -703,11 +717,11 @@ def render_provider(usage: Usage, cfg: dict[str, Any], now: float) -> tuple[str,
     if not usage.ok:
         # "warning", not "critical": a broken login should not look identical
         # to a genuinely exhausted quota. The red glyph already says enough.
-        return colorize(f"{label} !", colors["error"], cfg), "warning"
+        return colorize_label(f"{label} !", colors["error"], cfg), "warning"
 
     if not usage.windows:
         # Unlimited plan, or nothing metered.
-        return colorize(f"{label} ∞", colors["label"], cfg), "idle"
+        return colorize_label(f"{label} ∞", colors["label"], cfg), "idle"
 
     windows = usage.windows if cfg["show_short_window"] else usage.windows[-1:]
 
@@ -733,7 +747,7 @@ def render_provider(usage: Usage, cfg: dict[str, Any], now: float) -> tuple[str,
         parts.append(colorize(f"{win.used_pct:.0f}%", color, cfg))
 
     body = colorize("/", colors["dim"], cfg).join(parts)
-    text = f"{colorize(label, colors['label'], cfg)} {body}"
+    text = f"{colorize_label(label, colors['label'], cfg)} {body}"
 
     if cfg["show_reset"]:
         hottest = max(usage.windows, key=lambda w: w.used_pct)
@@ -767,7 +781,7 @@ def render(cfg: dict[str, Any], no_refresh: bool = False) -> dict[str, Any]:
             peak = candidate if peak is None else max(peak, candidate)
         if usage is None:
             chunks.append(
-                colorize(
+                colorize_label(
                     f"{cfg['labels'].get(name, name[:2].upper())} …",
                     cfg["colors"]["dim"],
                     cfg,

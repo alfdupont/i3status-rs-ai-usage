@@ -1,0 +1,9 @@
+{
+  "label_font": "Font Awesome 7 Brands",
+  "labels": {
+    "claude": "",
+    "codex": "",
+    "copilot": ""
+  },
+  "separator": "   "
+}
