@@ -45,8 +45,16 @@ not subscribe to can be removed from `providers` in the config.
 
 ### Arch Linux
 
+Available in the [AUR](https://aur.archlinux.org/packages/i3status-rs-ai-usage):
+
 ```sh
-git clone https://github.com/alfdupont/i3status-rs-ai-usage.git
+paru -S i3status-rs-ai-usage    # or: yay -S i3status-rs-ai-usage
+```
+
+Or by hand:
+
+```sh
+git clone https://aur.archlinux.org/i3status-rs-ai-usage.git
 cd i3status-rs-ai-usage
 makepkg -si
 ```
