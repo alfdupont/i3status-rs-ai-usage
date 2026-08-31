@@ -7,10 +7,16 @@ pkgdesc='AI subscription quota (Claude, Codex, Copilot) as an i3status-rust bloc
 arch=('any')
 url='https://github.com/alfdupont/i3status-rs-ai-usage'
 license=('GPL-3.0-or-later')
-depends=('python')
+# i3status-rust is a hard dependency: `render` emits i3status-rust's custom
+# block JSON, which is the entire point of the package. Note that the AUR
+# i3status-rust-git / -full-git packages do not declare provides=('i3status-rust'),
+# so users of those will need to add it locally.
+depends=('python' 'i3status-rust')
 makedepends=('git')
+# The font is genuinely optional: the default labels are the ASCII strings
+# CL/CX/CP, and the only other glyphs on the default path are the ordinary
+# text characters U+221E, U+2026 and U+00B7. Icons are opt-in via config.
 optdepends=(
-  'i3status-rust: the status generator this plugs into'
   'github-cli: fallback for reading the Copilot quota'
   'otf-font-awesome: vendor logo glyphs instead of text labels'
   'libnotify: right-click usage breakdown via notify-send'

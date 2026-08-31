@@ -29,11 +29,13 @@ Python 3.11+, standard library only. No daemon required.
 ## Requirements
 
 - **Python 3.11+** — standard library only, no pip packages.
-- **i3status-rust 0.34+** — for the `custom` block with `json = true`.
+- **i3status-rust** — for the `custom` block; tested on 0.36.1.
 - A bar that renders pango markup: **swaybar** (sway) or **i3bar** (i3).
 
-Optional: `github-cli` (a fallback for reading the Copilot quota) and
-`otf-font-awesome` (for [vendor logos](#vendor-logos) instead of text labels).
+Optional: `github-cli` (a fallback for reading the Copilot quota),
+`libnotify` (for the right-click breakdown) and `otf-font-awesome` (for
+[vendor logos](#vendor-logos)). No icon font is needed for the default
+labels, which are plain ASCII.
 
 You only need credentials for the services you actually use — see
 [Where the numbers come from](#where-the-numbers-come-from). Providers you do
