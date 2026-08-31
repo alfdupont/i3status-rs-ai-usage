@@ -50,7 +50,7 @@ from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
-__version__ = "1.0.1"
+__version__ = "1.0.2"
 
 HTTP_TIMEOUT = 12.0
 USER_AGENT = f"i3status-rs-ai-usage/{__version__}"
@@ -815,34 +815,35 @@ def _brief_safe(text: str, limit: int = 40) -> str:
 
 
 def show_brief(cfg: dict[str, Any], results: dict[str, Usage]) -> str:
-    """One short line per provider: usage and when each window resets.
+    """One short line per provider: only when each window resets.
 
-    Sized for a notification bubble, so no plan names and no cache ages.
+    Deliberately omits the percentages, because the bar block is already
+    showing them; this answers the other question, "when do I get it back".
+    Kept narrow and unpadded so it does not wrap in a notification bubble
+    (mako defaults to a 300px width and a 100px height cap, and a wrapped
+    line pushes the last provider out of view entirely).
     """
     now = time.time()
-    width = max((len(n) for n in cfg["providers"]), default=7) + 1
     lines = []
     for name in cfg["providers"]:
-        title = name.capitalize().ljust(width)
+        title = name.capitalize()
         usage = results.get(name)
         if usage is None:
-            lines.append(f"{title}no data")
+            lines.append(f"{title} no data")
             continue
         if not usage.ok:
-            lines.append(f"{title}! {_brief_safe(usage.error or 'error')}")
+            lines.append(f"{title} ! {_brief_safe(usage.error or 'error', 20)}")
             continue
         if not usage.windows:
-            lines.append(f"{title}unlimited")
+            lines.append(f"{title} unlimited")
             continue
-        bits = []
-        for win in usage.windows:
-            piece = f"{win.key} {win.used_pct:.0f}%"
-            if win.resets_at and win.resets_at > now:
-                # U+2192; U+21BB is absent from Noto Sans Mono, which is what
-                # mako falls back to, and would break the column alignment.
-                piece += f" \u2192{humanize_delta(win.resets_at - now)}"
-            bits.append(piece)
-        lines.append(title + "   ".join(bits))
+        # U+2192; U+21BB is absent from Noto Sans Mono, mako's fallback face.
+        bits = [
+            f"{w.key}\u2192{humanize_delta(w.resets_at - now)}"
+            for w in usage.windows
+            if w.resets_at and w.resets_at > now
+        ]
+        lines.append(f"{title} " + " ".join(bits) if bits else f"{title} \u2014")
     return "\n".join(lines)
 
 
